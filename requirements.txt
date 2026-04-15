@@ -6,4 +6,4 @@ plotly
 torch
 scikit-learn
 joblib
-streamlit-autorefresh
+streamlit-autorefresh   

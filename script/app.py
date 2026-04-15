@@ -12,7 +12,7 @@ from streamlit_autorefresh import st_autorefresh
 # ---------------- CONFIG ----------------
 PROMETHEUS_BASE = "http://192.168.49.2:30500/api/v1"
 PROMETHEUS_URL = f"{PROMETHEUS_BASE}/query"
-SCRAPE_INTERVAL = 1  # seconds
+SCRAPE_INTERVAL = 5  # seconds
 SEQ_LEN = 20
 TRAINED_FUTURE_STEPS = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,9 +208,9 @@ def overlay_chart(actual_df, pred_df, y_col, title, chart_type="line", time_wind
 
     # Chart rendering
     if chart_type == "area":
-        st.line_chart(df_plot, use_container_width=True)
+        st.line_chart(df_plot, width="stretch")
     else:
-        st.line_chart(df_plot, use_container_width=True)
+        st.line_chart(df_plot, width="stretch")
    
 # ---------------- STREAMLIT APP ----------------
 st.set_page_config(layout="wide")
@@ -409,7 +409,7 @@ if load_cols:
                 df_plot = df_plot.astype(float)
 
                 # Show chart
-                st.line_chart(df_plot, use_container_width=True)
+                st.line_chart(df_plot, width="stretch")
 
 
 
@@ -422,31 +422,3 @@ useful_cols = [c for c in df_display.columns if c in [
     "Disk_GiB_Used","Disk_Used_Percent"
 ] or "_node_load" in c]
 st.dataframe(df_display[useful_cols].tail(rown))
-
-# ---------------- LSTM RETRAIN AFTER EVERY RETRAIN_INTERVAL ENTRIES ----------------
-RETRAIN_INTERVAL = 10  # retrain after every 10 new rows
-
-# Initialize session state variables
-if "last_retrain_row_count" not in st.session_state:
-    st.session_state.last_retrain_row_count = 0
-if "retrain_in_progress" not in st.session_state:
-    st.session_state.retrain_in_progress = False
-
-# Calculate new rows since last retrain
-num_new_rows = len(st.session_state.df) - st.session_state.last_retrain_row_count
-
-# Trigger retraining
-if num_new_rows >= RETRAIN_INTERVAL and not st.session_state.retrain_in_progress:
-    st.session_state.retrain_in_progress = True
-    st.toast("🔄 Retraining LSTM model with latest data...")
-
-    try:
-        # Call external retrain.py
-        subprocess.run(["python", "retrain.py"], check=True)
-        st.toast("✅ LSTM retrained!")
-    except subprocess.CalledProcessError as e:
-        st.toast(f"Retraining failed: {e}")
-
-    # Update the row count tracker
-    st.session_state.last_retrain_row_count = len(st.session_state.df)
-    st.session_state.retrain_in_progress = False
