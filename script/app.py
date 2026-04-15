@@ -290,7 +290,7 @@ if len(df_recent) >= 1 and not future_preds_df.empty and common_features:
             value=f"{prediction_confidence:.2f}%",
             delta=f"{confidence_delta:.2f}%",
             chart_data=st.session_state.confidence_history,
-            chart_type="line",
+            chart_type="bar",
             help="Shows real-time prediction confidence",
             border=True,
         )

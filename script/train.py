@@ -25,7 +25,7 @@ SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 FEATURES_PATH = os.path.join(MODEL_DIR, "features.pkl")
 
 # ---------------- LOAD DATA ----------------
-df = pd.read_csv("data/cleaned_metrics.csv", parse_dates=["timestamp"])
+df = pd.read_csv("data/30000_data.csv", parse_dates=["timestamp"])
 df = df.drop(columns=["timestamp"])  # only numeric features
 
 # drop constant / static metrics
