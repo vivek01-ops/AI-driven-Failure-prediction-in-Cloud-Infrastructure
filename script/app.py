@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
 # ---------------- CONFIG ----------------
-PROMETHEUS_BASE = "http://192.168.49.2:32600/api/v1"
+PROMETHEUS_BASE = "http://192.168.49.2:30500/api/v1"
 PROMETHEUS_URL = f"{PROMETHEUS_BASE}/query"
 SCRAPE_INTERVAL = 1  # seconds
 SEQ_LEN = 20
