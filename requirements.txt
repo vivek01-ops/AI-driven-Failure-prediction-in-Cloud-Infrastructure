@@ -7,3 +7,5 @@ torch
 scikit-learn
 joblib
 streamlit-autorefresh   
+matplotlib
+seaborn
