@@ -9,8 +9,9 @@ import joblib
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
+
 # ---------------- CONFIG ----------------
-PROMETHEUS_BASE = "http://192.168.49.2:30500/api/v1"
+PROMETHEUS_BASE = "http://192.168.49.2:30477/api/v1"
 PROMETHEUS_URL = f"{PROMETHEUS_BASE}/query"
 SCRAPE_INTERVAL = 5  # seconds
 SEQ_LEN = 20
@@ -248,7 +249,7 @@ if st.session_state.df.empty or new_row != st.session_state.df.iloc[-1].to_dict(
 df_display = process_metrics(st.session_state.df.copy())
 df_recent = df_display[df_display["timestamp"] >= datetime.now()-time_delta]
 
-future_preds_df = make_forecast(df_display, interval)
+future_preds_df = pd.DataFrame()
 
 # ---------------- PREDICTION CONFIDENCE METRIC ----------------
 colp, colm = st.columns(2)
