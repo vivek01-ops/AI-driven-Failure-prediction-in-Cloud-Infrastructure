@@ -4,422 +4,410 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-import subprocess
 import joblib
+
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
-
-# ---------------- CONFIG ----------------
+# ======================================================
+# CONFIG
+# ======================================================
 PROMETHEUS_BASE = "http://192.168.49.2:30477/api/v1"
-PROMETHEUS_URL = f"{PROMETHEUS_BASE}/query"
-SCRAPE_INTERVAL = 5  # seconds
-SEQ_LEN = 20
-TRAINED_FUTURE_STEPS = 10
+PROM_URL = f"{PROMETHEUS_BASE}/query"
+
+SCRAPE_INTERVAL = 5
+SEQ_LEN = 40
+FUTURE_STEPS = 10
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_DIR = "model"
 
-MODEL_PATH = "model/lstm_forecast_multistep.pth"
-SCALER_PATH = "model/scaler.pkl"
-FEATURES_PATH = "model/features.pkl"
+# ======================================================
+# STREAMLIT
+# ======================================================
+st.set_page_config(layout="wide")
+st.title("Infrastructure Monitoring with LSTM Models")
 
-# ---------------- LOAD SCALER & FEATURES ----------------
-scaler = joblib.load(SCALER_PATH)
-FEATURES = joblib.load(FEATURES_PATH)
-
-# Drop static / capacity features (not used in training)
-DROP_FEATURES = ["Memory_GiB_Total", "Disk_GiB_Total"]
-FEATURES = [f for f in FEATURES if f not in DROP_FEATURES]
-
-INPUT_SIZE = len(FEATURES)
-
-
-# ---------------- METRICS ----------------
-METRICS_RAW = {
-    "CPU_percent": '100 - (avg by (instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
-    "node_memory_MemAvailable_bytes": "node_memory_MemAvailable_bytes",
-    "node_memory_MemTotal_bytes": "node_memory_MemTotal_bytes",
-    "node_filesystem_size_bytes": 'avg(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})',
-    "node_filesystem_avail_bytes": 'avg(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"})'
-}
-NODE_LOAD_METRICS = ["node_load1", "node_load5", "node_load15"]
-
-# ---------------- MODEL ----------------
-class LSTMForecastMulti(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=3,
-                 future_steps=TRAINED_FUTURE_STEPS, dropout=0.2):
+# ======================================================
+# MODEL CLASS (same as trainer)
+# ======================================================
+class LSTMForecast(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, input_size * future_steps)
-        self.input_size = input_size
-        self.future_steps = future_steps
+
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=128,
+            num_layers=3,
+            batch_first=True,
+            dropout=0.2
+        )
+
+        self.fc = nn.Linear(128, FUTURE_STEPS)
 
     def forward(self, x):
         out, _ = self.lstm(x)
         out = self.fc(out[:, -1, :])
-        return out.view(-1, self.future_steps, self.input_size)
+        return out
 
-# Init + Load
-lstm_model = LSTMForecastMulti(INPUT_SIZE, 128, 3, TRAINED_FUTURE_STEPS, 0.2).to(DEVICE)
-lstm_model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-lstm_model.eval()
 
-# ---------------- HELPERS ----------------
-def query_prometheus(query):
+# ======================================================
+# LOAD MODELS
+# ======================================================
+TARGETS = ["cpu", "memory", "disk", "node1", "node5", "node15"]
+
+MODELS = {}
+SCALERS = {}
+
+for t in TARGETS:
     try:
-        r = requests.get(PROMETHEUS_URL, params={"query": query}, timeout=3)
-        result = r.json()
-        if result.get("status") == "success":
-            values = result["data"]["result"]
-            if values:
-                vals = [float(v["value"][1]) for v in values]
-                return sum(vals) / len(vals)
-        return None
-    except Exception:
+        model = LSTMForecast().to(DEVICE)
+        model.load_state_dict(
+            torch.load(f"{MODEL_DIR}/{t}_model.pth", map_location=DEVICE)
+        )
+        model.eval()
+
+        scaler = joblib.load(f"{MODEL_DIR}/{t}_scaler.pkl")
+
+        MODELS[t] = model
+        SCALERS[t] = scaler
+
+    except:
+        pass
+
+
+# ======================================================
+# PROMETHEUS QUERIES
+# ======================================================
+METRICS = {
+    "cpu": '100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
+
+    "mem_avail": "node_memory_MemAvailable_bytes",
+    "mem_total": "node_memory_MemTotal_bytes",
+
+    "disk_avail": 'avg(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"})',
+    "disk_total": 'avg(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})',
+
+    "node1": "avg(node_load1)",
+    "node5": "avg(node_load5)",
+    "node15": "avg(node_load15)",
+}
+
+
+# ======================================================
+# HELPERS
+# ======================================================
+def query_prom(query):
+    try:
+        r = requests.get(PROM_URL, params={"query": query}, timeout=3)
+        data = r.json()
+
+        if data["status"] == "success":
+            vals = data["data"]["result"]
+
+            if vals:
+                nums = [float(v["value"][1]) for v in vals]
+                return np.mean(nums)
+
+    except:
         return None
 
-def get_node_loads():
-    loads = {}
-    for metric in NODE_LOAD_METRICS:
-        try:
-            r = requests.get(PROMETHEUS_URL, params={"query": metric}, timeout=3)
-            result = r.json()
-            if result.get("status") == "success":
-                for item in result["data"]["result"]:
-                    node = item["metric"].get("instance", "unknown")
-                    value = float(item["value"][1])
-                    loads[f"{node}_{metric}"] = value
-        except Exception:
-            continue
-    return loads
+    return None
+
 
 def scrape_metrics():
-    data = {"timestamp": datetime.now()}
-    for name, query in METRICS_RAW.items():
-        value = query_prometheus(query)
-        if value is not None:
-            data[name] = value
-    data.update(get_node_loads())
-    return data
 
-def process_metrics(df):
-    if df.empty:
-        return df
-    if "node_memory_MemAvailable_bytes" in df.columns and "node_memory_MemTotal_bytes" in df.columns:
-        df["Memory_GiB_Available"] = df["node_memory_MemAvailable_bytes"] / (1024**3)
-        df["Memory_GiB_Total"] = df["node_memory_MemTotal_bytes"] / (1024**3)
-        df["Memory_GiB_Used"] = df["Memory_GiB_Total"] - df["Memory_GiB_Available"]
-        df["Memory_Used_Percent"] = (df["Memory_GiB_Used"] / df["Memory_GiB_Total"]) * 100
-    if "node_filesystem_size_bytes" in df.columns and "node_filesystem_avail_bytes" in df.columns:
-        df["Disk_GiB_Total"] = df["node_filesystem_size_bytes"] / (1024**3)
-        df["Disk_GiB_Available"] = df["node_filesystem_avail_bytes"] / (1024**3)
-        df["Disk_GiB_Used"] = df["Disk_GiB_Total"] - df["Disk_GiB_Available"]
-        df["Disk_Used_Percent"] = (df["Disk_GiB_Used"] / df["Disk_GiB_Total"]) * 100
-    return df
+    row = {"timestamp": datetime.now()}
 
-def make_forecast(df_display, interval):
-    """
-    Forecast metrics starting at t=0 up to current time + future horizon.
-    Ensures predicted curve is longer than actual.
-    """
-    if len(df_display) < SEQ_LEN:
-        return pd.DataFrame()
+    cpu = query_prom(METRICS["cpu"])
+    mem_avail = query_prom(METRICS["mem_avail"])
+    mem_total = query_prom(METRICS["mem_total"])
 
-    missing = [f for f in FEATURES if f not in df_display.columns]
-    if missing:
-        st.warning(f"Skipping forecast — missing features in live data: {missing}")
-        return pd.DataFrame()
+    disk_avail = query_prom(METRICS["disk_avail"])
+    disk_total = query_prom(METRICS["disk_total"])
 
-    try:
-        features = df_display[FEATURES].values
-        timestamps = df_display["timestamp"].values
+    node1 = query_prom(METRICS["node1"])
+    node5 = query_prom(METRICS["node5"])
+    node15 = query_prom(METRICS["node15"])
 
-        preds_aligned = []
-        times_aligned = []
+    if cpu is not None:
+        row["CPU_percent"] = cpu
 
-        # Step 1: rolling predictions aligned with actuals
-        for i in range(len(features) - SEQ_LEN):
-            seq = features[i:i+SEQ_LEN]
-            seq_scaled = scaler.transform(seq)
-            X = torch.tensor(seq_scaled[np.newaxis, :, :], dtype=torch.float32).to(DEVICE)
+    if mem_avail and mem_total:
+        used = mem_total - mem_avail
+        row["Memory_GiB_Used"] = used / (1024**3)
+        row["Memory_Used_Percent"] = used / mem_total * 100
 
-            with torch.no_grad():
-                pred_scaled = lstm_model(X).cpu().numpy()[0]
+    if disk_avail and disk_total:
+        used = disk_total - disk_avail
+        row["Disk_GiB_Used"] = used / (1024**3)
+        row["Disk_Used_Percent"] = used / disk_total * 100
 
-            pred = scaler.inverse_transform(pred_scaled)
+    if node1 is not None:
+        row["node1"] = node1
 
-            # Only keep the first-step prediction to align with actual
-            preds_aligned.append(pred[0])
-            times_aligned.append(timestamps[i+SEQ_LEN])  # align with next time step
+    if node5 is not None:
+        row["node5"] = node5
 
-        # Step 2: future horizon prediction from the last window
-        last_seq = features[-SEQ_LEN:]
-        seq_scaled = scaler.transform(last_seq)
-        X = torch.tensor(seq_scaled[np.newaxis, :, :], dtype=torch.float32).to(DEVICE)
+    if node15 is not None:
+        row["node15"] = node15
 
-        with torch.no_grad():
-            pred_scaled = lstm_model(X).cpu().numpy()[0]
+    return row
 
-        future_pred = scaler.inverse_transform(pred_scaled)
 
-        last_time = df_display["timestamp"].iloc[-1]
-        future_times = [last_time + timedelta(seconds=interval*(i+1)) for i in range(TRAINED_FUTURE_STEPS)]
+# ======================================================
+# FORECAST ONE METRIC
+# ======================================================
+def predict_metric(series, metric_name):
 
-        preds_full = np.vstack([preds_aligned, future_pred])
-        times_full = list(times_aligned) + future_times
+    if len(series) < SEQ_LEN:
+        return []
 
-        forecast_df = pd.DataFrame(preds_full, columns=FEATURES)
-        forecast_df["timestamp"] = times_full
+    arr = np.array(series[-SEQ_LEN:]).reshape(-1, 1)
 
-        return forecast_df
+    scaler = SCALERS[metric_name]
+    model = MODELS[metric_name]
 
-    except Exception as e:
-        st.warning(f"LSTM forecast error: {e}")
-        return pd.DataFrame()
+    scaled = scaler.transform(arr)
 
-def overlay_chart(actual_df, pred_df, y_col, title, chart_type="line", time_window=None):
-    """
-    Overlay actual and predicted values within a specific time window.
-    """
+    x = torch.tensor(
+        scaled[np.newaxis, :, :],
+        dtype=torch.float32
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        pred = model(x).cpu().numpy()[0]
+
+    pred = scaler.inverse_transform(pred.reshape(-1, 1)).flatten()
+
+    return pred
+
+
+# ======================================================
+# CHART FUNCTION
+# ======================================================
+# ======================================================
+# REPLACE OLD show_chart() FUNCTION WITH THIS
+# ======================================================
+
+def show_chart(df, col, metric_key, title):
+
     st.subheader(title, divider="red")
 
-    # Apply time window to actual data
-    df_actual = actual_df.copy()
-    if time_window is not None:
-        df_actual = df_actual[df_actual["timestamp"] >= datetime.now() - time_window]
+    actual = df[["timestamp", col]].copy()
+    pred = predict_metric(df[col].dropna().tolist(), metric_key)
 
-    df_plot = pd.DataFrame({
-        "timestamp": df_actual["timestamp"],
-        "Actual": df_actual[y_col]
-    }).set_index("timestamp")
+    current_actual = df[col].iloc[-1]
 
-    # Apply same time window to predictions
-    if not pred_df.empty and y_col in pred_df.columns:
-        df_pred = pred_df.copy()
-        if time_window is not None:
-            df_pred = df_pred[df_pred["timestamp"] >= datetime.now() - time_window]
+    if len(pred) > 0:
 
-        pred_series = pd.Series(
-            df_pred[y_col].values,
-            index=df_pred["timestamp"]
+        # ----------------------------
+        # current prediction (next step)
+        # ----------------------------
+        current_pred = pred[0]
+
+        # ----------------------------
+        # future selectable point
+        # ----------------------------
+        future_option = st.selectbox(
+            f"{title} Future Time",
+            ["1 min", "2 min"],
+            key=f"{metric_key}_future"
         )
 
-        # Merge actual and predicted
-        df_plot = df_plot.merge(pred_series.rename("Predicted"), left_index=True, right_index=True, how="outer")
+        mins = int(future_option.split()[0])
 
-    # Chart rendering
-    if chart_type == "area":
-        st.line_chart(df_plot, width="stretch")
+        # if refresh = 5 sec
+        # 1 min = 12 steps
+        # 2 min = 24 steps
+        step_index = int((mins * 60) / SCRAPE_INTERVAL) - 1
+
+        # if model only predicts 10 steps, cap last step
+        step_index = min(step_index, len(pred) - 1)
+
+        future_pred = pred[step_index]
+
+        # ----------------------------
+        # METRICS
+        # ----------------------------
+        delta1_val = current_pred - current_actual
+        delta2_val = future_pred - current_actual
+        m1, m2, m3 = st.columns(3, border=True)
+        is_percent = metric_key in ["cpu", "memory", "disk"]
+
+        suffix = "%" if is_percent else ""
+
+
+        with m1:
+            st.metric(
+                "Current Actual",
+                f"{current_actual:.2f}{suffix}"
+            )
+
+        with m2:
+            st.metric(
+                "Current Predicted",
+                f"{current_pred:.2f}{suffix}",
+                delta=f"{delta1_val:+.2f}{suffix} vs actual"
+            )
+
+        with m3:
+            st.metric(
+                f"Predicted After {future_option}",
+                f"{future_pred:.2f}{suffix}",
+                delta=f"{delta2_val:+.2f}{suffix} vs actual"
+            )
+
+        # ----------------------------
+        # CHART
+        # ----------------------------
+        last_time = df["timestamp"].iloc[-1]
+
+        future_times = [
+            last_time + timedelta(seconds=SCRAPE_INTERVAL*(i+1))
+            for i in range(FUTURE_STEPS)
+        ]
+
+        is_percent = metric_key in ["cpu", "memory", "disk"]
+
+        actual_name = "Actual %" if is_percent else "Actual"
+        pred_name = "Predicted %" if is_percent else "Predicted"
+
+        pred_df = pd.DataFrame({
+            "timestamp": future_times,
+            pred_name: pred
+        })
+
+        actual = actual.rename(columns={col: actual_name})
+        actual = actual.set_index("timestamp")
+        pred_df = pred_df.set_index("timestamp")
+
+        merged = actual.merge(
+            pred_df,
+            left_index=True,
+            right_index=True,
+            how="outer"
+        )
+
+        st.area_chart(merged, width="stretch")
+
     else:
-        st.line_chart(df_plot, width="stretch")
-   
-# ---------------- STREAMLIT APP ----------------
-st.set_page_config(layout="wide")
-st.title("Real-Time Prometheus Dashboard with LSTM Forecasts")
+        st.metric("Current Actual", f"{current_actual:.2f}", border=True)
+        st.line_chart(actual.set_index("timestamp"), width="stretch")
 
-# Sidebar
-col1, col2 = st.columns(2, gap="medium")
+
+# ======================================================
+# SIDEBAR
+# ======================================================
+col1, col2 = st.columns(2)
+
 with col1:
-    interval = st.number_input("Scrape Interval (sec)", min_value=1, value=SCRAPE_INTERVAL)
-with col2:
-    time_window_option = st.selectbox(
-        "Time Window",
-        ("30 sec","1 min","5 min","10 min","30 min","1 hr","2 hr","5 hr","6 hr","8 hr","12 hr","18 hr","24 hr")
+    interval = st.number_input(
+        "Refresh Seconds",
+        min_value=1,
+        value=SCRAPE_INTERVAL
     )
 
-num, unit = time_window_option.split()
-num = int(num)
-if unit.startswith("sec"): time_delta = timedelta(seconds=num)
-elif unit.startswith("min"): time_delta = timedelta(minutes=num)
-else: time_delta = timedelta(hours=num)
+with col2:
+    rows = st.selectbox(
+        "Rows",
+        [30, 50, 100, 200],
+        index=1
+    )
 
-st_autorefresh(interval=interval * 1000, key="auto_refresh")
+st_autorefresh(interval=interval*1000, key="refresh")
 
-# Data init
+
+# ======================================================
+# SESSION DATAFRAME
+# ======================================================
 if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame(columns=["timestamp"] + list(METRICS_RAW.keys()) + NODE_LOAD_METRICS)
+    st.session_state.df = pd.DataFrame()
 
 new_row = scrape_metrics()
-if not new_row:
-    st.warning("No metrics scraped yet — waiting for Prometheus.")
-    st.stop()
-if st.session_state.df.empty or new_row != st.session_state.df.iloc[-1].to_dict():
-    st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
 
-df_display = process_metrics(st.session_state.df.copy())
-df_recent = df_display[df_display["timestamp"] >= datetime.now()-time_delta]
+st.session_state.df = pd.concat(
+    [st.session_state.df, pd.DataFrame([new_row])],
+    ignore_index=True
+)
 
-future_preds_df = pd.DataFrame()
+df = st.session_state.df.tail(rows).copy()
 
-# ---------------- PREDICTION CONFIDENCE METRIC ----------------
-colp, colm = st.columns(2)
 
-# Initialize histories if not exists
-if "confidence_history" not in st.session_state:
-    st.session_state.confidence_history = []
-if "accuracy_history" not in st.session_state:
-    st.session_state.accuracy_history = []
+# ======================================================
+# METRICS
+# ======================================================
+# c1, c2, c3 = st.columns(3)
 
-# ---------------- REAL-TIME PREDICTION CONFIDENCE ----------------
-available_features = [f for f in FEATURES if f in df_recent.columns]
-pred_available_features = [f for f in FEATURES if (not future_preds_df.empty and f in future_preds_df.columns)]
+# with c1:
+#     if "CPU_percent" in df.columns:
+#         st.metric("CPU %", f"{df['CPU_percent'].iloc[-1]:.2f}")
 
-# Intersection of features present in both actual recent and prediction frames
-common_features = [f for f in available_features if f in pred_available_features]
+# with c2:
+#     if "Memory_Used_Percent" in df.columns:
+#         st.metric("Memory %", f"{df['Memory_Used_Percent'].iloc[-1]:.2f}")
 
-if len(df_recent) >= 1 and not future_preds_df.empty and common_features:
-    last_actual = df_recent[common_features].iloc[-1].values
-    last_pred = future_preds_df[common_features].iloc[0].values
+# with c3:
+#     if "Disk_Used_Percent" in df.columns:
+#         st.metric("Disk %", f"{df['Disk_Used_Percent'].iloc[-1]:.2f}")
 
-    # Real-time per-metric confidence
-    confidences = [max(0, 100 - (abs(pred - actual)/max(abs(actual), 1))*100)
-                   for actual, pred in zip(last_actual, last_pred)]
-    prediction_confidence = np.mean(confidences) if confidences else 0.0
 
-    # Update confidence history
-    st.session_state.confidence_history.append(prediction_confidence)
-    if len(st.session_state.confidence_history) > 50:
-        st.session_state.confidence_history = st.session_state.confidence_history[-50:]
+# ======================================================
+# MAIN CHARTS
+# ======================================================
 
-    # Delta for prediction confidence
-    confidence_delta = (st.session_state.confidence_history[-1] -
-                        st.session_state.confidence_history[-2]) if len(st.session_state.confidence_history) > 1 else 0
+a, b, c = st.columns(3, border=True)
 
-    with colp:
-        st.metric(
-            label="Prediction Confidence (%)",
-            value=f"{prediction_confidence:.2f}%",
-            delta=f"{confidence_delta:.2f}%",
-            chart_data=st.session_state.confidence_history,
-            chart_type="bar",
-            help="Shows real-time prediction confidence",
-            border=True,
-        )
-else:
-    with colp:
-        st.metric(
-            label="Prediction Confidence (%)",
-            value="N/A",
-            delta="N/A",
-            help="Shows real-time prediction confidence",
-            border=True
+with a:
+    if "Memory_Used_Percent" in df.columns:
+        show_chart(
+            df,
+            "Memory_Used_Percent",
+            "memory",
+            "Memory Usage (%)"
         )
 
-# ---------------- MODEL ACCURACY (updated only on retrain) ----------------
-# Use last stored retrain accuracy if exists
-if "last_model_accuracy" not in st.session_state:
-    st.session_state.last_model_accuracy = None
-
-if st.session_state.last_model_accuracy is not None:
-    model_accuracy = st.session_state.last_model_accuracy
-    st.session_state.accuracy_history.append(model_accuracy)
-    if len(st.session_state.accuracy_history) > 50:
-        st.session_state.accuracy_history = st.session_state.accuracy_history[-50:]
-
-    # Delta for model accuracy
-    accuracy_delta = (st.session_state.accuracy_history[-1] -
-                      st.session_state.accuracy_history[-2]) if len(st.session_state.accuracy_history) > 1 else 0
-
-    with colm:
-        st.metric(
-            label="Model Accuracy (%)",
-            value=f"{model_accuracy:.2f}%",
-            delta=f"{accuracy_delta:.2f}%",
-            chart_data=st.session_state.accuracy_history,
-            chart_type="line",
-            help="Model accuracy after last retraining",
-            border=True
-        )
-else:
-    with colm:
-        st.metric(
-            label="Model Accuracy (%)",
-            value="N/A",
-            delta="N/A",
-            help="Model accuracy after last retraining",
-            border=True
+with b:
+    if "CPU_percent" in df.columns:
+        show_chart(
+            df,
+            "CPU_percent",
+            "cpu",
+            "CPU Usage (%)"
         )
 
-# Charts
-cola, colb, colc = st.columns(3, border=True)
-
-with cola:
-    if "Memory_GiB_Used" in df_recent.columns:
-        overlay_chart(df_display, future_preds_df, "Memory_GiB_Used", 
-                      f"Memory Usage (GiB) ({time_window_option})", 
-                      chart_type="area", time_window=time_delta)
-with colb:
-    if "CPU_percent" in df_recent.columns:
-        overlay_chart(df_display, future_preds_df, "CPU_percent", 
-                      f"CPU Usage (%) ({time_window_option})", 
-                      chart_type="line", time_window=time_delta)
-with colc:
-    if "Disk_GiB_Used" in df_recent.columns:
-        overlay_chart(df_display, future_preds_df, "Disk_GiB_Used", 
-                      f"Disk Usage (GiB) ({time_window_option})", 
-                      chart_type="area", time_window=time_delta)
-
-# ---- NODE LOAD METRICS (3 charts per row per node) ----
-# ---- NODE LOAD METRICS (aligned per-column with time window) ----
-load_cols = [c for c in df_recent.columns if "_node_load" in c]
-
-if load_cols:
-    nodes = sorted({c.split("_node_load")[0] for c in load_cols})
-    st.header(f"Node Load Averages ({time_window_option})")
-
-    # Ensure predictions timestamps are datetime if preds exist
-    if not future_preds_df.empty and "timestamp" in future_preds_df.columns:
-        future_preds_df["timestamp"] = pd.to_datetime(future_preds_df["timestamp"])
-
-    for node in nodes:
-        st.subheader(f"Node: `{node}`")
-        col1, col2, col3 = st.columns(3, border=True)
-
-        for load_metric, col in zip(["load1", "load5", "load15"], [col1, col2, col3]):
-            colname = f"{node}_node_{load_metric}"
-            if colname not in df_recent.columns:
-                continue
-
-            with col:
-                st.subheader(f"**{load_metric.upper()}**", divider="red")
-
-                # Filter actual and predicted by time window
-                df_actual = df_display.copy()
-                df_actual = df_actual[df_actual["timestamp"] >= datetime.now() - time_delta]
-
-                df_plot = pd.DataFrame({
-                    "timestamp": df_actual["timestamp"],
-                    "Actual": df_actual[colname]
-                }).set_index("timestamp")
-
-                # Predictions filtered by time window
-                if not future_preds_df.empty and colname in future_preds_df.columns:
-                    df_pred = future_preds_df.copy()
-                    df_pred = df_pred[df_pred["timestamp"] >= datetime.now() - time_delta]
-
-                    pred_series = pd.Series(
-                        df_pred[colname].values,
-                        index=pd.to_datetime(df_pred["timestamp"])
-                    )
-
-                    # Merge actual and predicted
-                    df_plot = df_plot.merge(pred_series.rename("Predicted"),
-                                            left_index=True, right_index=True, how="outer")
-
-                # Cast to float for safety
-                df_plot = df_plot.astype(float)
-
-                # Show chart
-                st.line_chart(df_plot, width="stretch")
+with c:
+    if "Disk_Used_Percent" in df.columns:
+        show_chart(
+            df,
+            "Disk_Used_Percent",
+            "disk",
+            "Disk Usage (%)"
+        )
 
 
+# ======================================================
+# NODE LOADS
+# ======================================================
+st.header("Node Loads")
 
-# Data Table
+n1, n2, n3 = st.columns(3, border=True)
+
+with n1:
+    if "node1" in df.columns:
+        show_chart(df, "node1", "node1", "Load 1")
+
+with n2:
+    if "node5" in df.columns:
+        show_chart(df, "node5", "node5", "Load 5")
+
+with n3:
+    if "node15" in df.columns:
+        show_chart(df, "node15", "node15", "Load 15")
+
+
+# ======================================================
+# TABLE
+# ======================================================
 st.subheader("Recent Data", divider="red")
-rown = st.selectbox("Show last N rows", (10,20,30,40,50,100))
-useful_cols = [c for c in df_display.columns if c in [
-    "timestamp", "CPU_percent",
-    "Memory_GiB_Used","Memory_Used_Percent",
-    "Disk_GiB_Used","Disk_Used_Percent"
-] or "_node_load" in c]
-st.dataframe(df_display[useful_cols].tail(rown))
+st.dataframe(df.tail(20), width="stretch")
