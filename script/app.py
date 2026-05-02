@@ -18,12 +18,17 @@ SCRAPE_INTERVAL = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_DIR = "model"
 PROM_URL = "http://192.168.49.2:30477/api/v1/query"
-
+    
 # =========================
 # PAGE
 # =========================
-st.set_page_config(layout="wide")
-st.title("📊 AI Infrastructure Monitoring Dashboard")
+st.set_page_config(
+    layout="wide",
+    page_title="AI Infrastructure Monitoring Dashboard",
+    page_icon="📊"
+)
+st.title("AI Infrastructure Monitoring Dashboard", text_alignment="center")
+st.divider(width="stretch")
 
 # =========================
 # MODEL
@@ -157,13 +162,12 @@ def status_label(score):
         return "🔴 Critical"
 
 def prediction_confidence(df):
-    if len(df) < SEQ_LEN:
-        return 0
+    vals = df["CPU_percent"].dropna()
 
-    vals = df["CPU_percent"].dropna().tail(SEQ_LEN)
+    if len(vals) < 5:
+        return 50   # start neutral instead of 0
 
-    if len(vals) < 10:
-        return 50
+    vals = vals.tail(min(len(vals), SEQ_LEN))
 
     mean = vals.mean()
     std = vals.std()
@@ -171,7 +175,7 @@ def prediction_confidence(df):
     if mean == 0:
         return 50
 
-    return round(max(0,100-(std/mean)*100),1)
+    return round(max(0, 100 - (std / mean) * 100), 1)
 
 def get_cutoff(window):
     num = int(window.split()[0])
@@ -205,16 +209,35 @@ st.session_state.df = pd.concat(
     ignore_index=True
 )
 
+# =========================
+# CONFIDENCE HISTORY
+# =========================
+if "confidence_history" not in st.session_state:
+    st.session_state.confidence_history = pd.DataFrame(columns=["timestamp", "confidence"])
+
+# current confidence (based on full data)
+conf_now = prediction_confidence(st.session_state.df)
+
+# store it
+st.session_state.confidence_history = pd.concat([
+    st.session_state.confidence_history,
+    pd.DataFrame([{
+        "timestamp": datetime.now(),
+        "confidence": conf_now
+    }])
+], ignore_index=True)
 
 # =========================
 # CONTROLS
 # =========================
-with st.container(border=True):
+with st.container():
     st.subheader("⚙️ Control Panel")
-    c1, c2 = st.columns(2)
+
+    c1, c2, c3 = st.columns(3, border=True)
+
     with c1:
         refresh = st.number_input("Refresh (sec)", step=1, min_value=1, value=5)
-        st_autorefresh(interval=refresh*1000)
+
     with c2:
         window = st.selectbox(
             "Window",
@@ -224,10 +247,29 @@ with st.container(border=True):
                 "1 hr", "6 hr", "12 hr",
                 "1 day", "2 days", "7 days"
             ],
-            index=1  # 👉 default = 5 sec
+            index=2
+        )
+
+    with c3:
+        selected_metrics = st.multiselect(
+            "Select Metrics",
+            [
+                "CPU Usage",
+                "Memory Usage",
+                "Disk Usage",
+                "Load 1",
+                "Load 5",
+                "Load 15"
+            ],
+            default=[
+                "CPU Usage",
+                "Memory Usage",
+                "Disk Usage"
+            ]
         )
 
 cutoff = get_cutoff(window)
+st_autorefresh(interval=refresh*1000)
 
 # 🔥 FULL DATA (for prediction)
 df_full = st.session_state.df.copy()
@@ -253,11 +295,12 @@ with st.container():
 
     c1,c2,c3,c4,c5 = st.columns(5, border=True)
 
+    health = calculate_health(df_full)
     if usable >= SEQ_LEN:
 
         cpu_pred = predict(df_full["CPU_percent"], "cpu")
 
-        health = calculate_health(df_full)
+        # health = calculate_health(df_full)
 
         if len(cpu_pred) == 0:
             future = health
@@ -266,18 +309,35 @@ with st.container():
 
         conf = prediction_confidence(df_full)
 
-        c1.metric("Health", f"{health}/100")
-        c2.metric("Predicted Health", f"{future:.1f}/100", f"{future-health:+.1f}")
-        c3.metric("Confidence", f"{conf}%")
-        c4.metric("Status", status_label(health))
-        c5.metric("Prometheus", "Connected" if prom_ok else "Disconnected ❌")
+        c1.metric("❤️ Current Health", f"{health}/100", f"{health-future:+.1f} than Predicted Health")
+        c2.metric("💖 Predicted Health", f"{future:.1f}/100", f"{future-health:+.1f} than Current Health")
+        conf_df = st.session_state.confidence_history.copy()
+
+        # 🔥 APPLY SAME TIME WINDOW FILTER
+        conf_df = conf_df[conf_df["timestamp"] >= cutoff]
+
+        # 🔥 fallback if too few points
+        if len(conf_df) < 5:
+            conf_df = st.session_state.confidence_history.copy().tail(10)
+
+        conf_series = conf_df["confidence"].astype(float).tolist()
+
+        c3.metric(
+            "🌟 Confidence",
+            f"{conf}%",
+            delta=None,
+            chart_data=conf_series,
+            chart_type="line"
+        )
+        c4.metric("📋 Status", status_label(health))
+        c5.metric("🔥 Prometheus", "Connected" if prom_ok else "Disconnected ❌")
 
     else:
-        c1.metric("Health","--")
-        c2.metric("Prediction","--")
-        c3.metric("Samples Needed", SEQ_LEN-usable)
-        c4.metric("Status","Collecting")
-        c5.metric("Prometheus", "Connected" if prom_ok else "Disconnected ❌")
+        c1.metric("❤️ Current Health", f"{health}/100")
+        c2.metric("💖 Predicted Health","...", "Waiting for LSTM engine to start prediction", delta_color="off", delta_arrow="off")
+        c3.metric("🧪 Samples Needed", SEQ_LEN-usable, "out of 40", delta_color="off", delta_arrow="off")
+        c4.metric("📋 Status","Collecting Metrics")
+        c5.metric("🔥 Prometheus", "Connected" if prom_ok else "Disconnected ❌")
 
 # =========================
 # PANEL
@@ -286,7 +346,7 @@ def panel(df, col, key, title, is_percent=False):
 
     with st.container(border=True):
 
-        st.subheader(title)
+        st.subheader(title, text_alignment="center", divider="grey")
 
         current = df[col].iloc[-1]
         pred = predict(st.session_state.df[col], key)
@@ -310,7 +370,7 @@ def panel(df, col, key, title, is_percent=False):
             last = df["timestamp"].iloc[-1]
 
             future_time = [
-                last + timedelta(seconds=SCRAPE_INTERVAL*(i+1))
+                last + timedelta(seconds=SCRAPE_INTERVAL*i)
                 for i in range(FUTURE_STEPS)
             ]
 
@@ -332,21 +392,26 @@ def panel(df, col, key, title, is_percent=False):
 # =========================
 st.subheader("📈 Metrics Dashboard")
 
-metrics = [
-    ("CPU_percent","cpu","CPU Usage",True),
-    ("Memory_Used_Percent","memory","Memory Usage",True),
-    ("Disk_Used_Percent","disk","Disk Usage",True),
-    ("node1","node1","Load 1",False),
-    ("node5","node5","Load 5",False),
-    ("node15","node15","Load 15",False),
+metrics = {
+    "CPU Usage": ("CPU_percent","cpu",True),
+    "Memory Usage": ("Memory_Used_Percent","memory",True),
+    "Disk Usage": ("Disk_Used_Percent","disk",True),
+    "Load 1": ("node1","node1",False),
+    "Load 5": ("node5","node5",False),
+    "Load 15": ("node15","node15",False),
+}
+
+selected_data = [
+    (metrics[name][0], metrics[name][1], name, metrics[name][2])
+    for name in selected_metrics
 ]
 
-for i in range(0, len(metrics), 2):
+for i in range(0, len(selected_data), 2):
     cols = st.columns(2)
 
     for j in range(2):
-        if i+j < len(metrics):
-            col,key,title,p = metrics[i+j]
+        if i + j < len(selected_data):
+            col, key, title, p = selected_data[i + j]
             with cols[j]:
                 panel(df, col, key, title, p)
 
@@ -355,4 +420,4 @@ for i in range(0, len(metrics), 2):
 # =========================
 with st.container(border=True):
     st.subheader("📋 Latest Metrics")
-    st.dataframe(df.tail(20), use_container_width=True)
+    st.dataframe(df, width="stretch")
