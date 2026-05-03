@@ -215,17 +215,6 @@ st.session_state.df = pd.concat(
 if "confidence_history" not in st.session_state:
     st.session_state.confidence_history = pd.DataFrame(columns=["timestamp", "confidence"])
 
-# current confidence (based on full data)
-conf_now = prediction_confidence(st.session_state.df)
-
-# store it
-st.session_state.confidence_history = pd.concat([
-    st.session_state.confidence_history,
-    pd.DataFrame([{
-        "timestamp": datetime.now(),
-        "confidence": conf_now
-    }])
-], ignore_index=True)
 
 # =========================
 # CONTROLS
@@ -293,52 +282,102 @@ with st.container():
     prom_ok = check_prometheus()
     usable = len(df_full["CPU_percent"].dropna())
 
-    c1,c2,c3,c4,c5 = st.columns(5, border=True)
+    c1, c2, c3, c4, c5 = st.columns(5, border=True)
 
     health = calculate_health(df_full)
-    if usable >= SEQ_LEN:
 
+    # =========================
+    # BEFORE MODEL READY
+    # =========================
+    if usable < SEQ_LEN:
+
+        c1.metric("❤️ Current Health", f"{health}/100", f"+/-{0} than Predicted Health", delta_arrow="off", delta_color="off")
+
+        c2.metric(
+            "💖 Predicted Health",
+            "...",
+            "Waiting for LSTM engine to start prediction",
+            delta_color="off",
+            delta_arrow="off"
+        )
+
+        c3.metric(
+            "🧪 Samples Needed",
+            SEQ_LEN - usable,
+            "out of 40",
+            delta_color="off",
+            delta_arrow="off"
+        )
+
+        c4.metric("📋 Status", "Collecting Metrics")
+        c5.metric("🔥 Prometheus", "Connected" if prom_ok else "Disconnected ❌")
+
+    # =========================
+    # AFTER MODEL READY
+    # =========================
+    else:
+
+        # ---------- Prediction ----------
         cpu_pred = predict(df_full["CPU_percent"], "cpu")
-
-        # health = calculate_health(df_full)
 
         if len(cpu_pred) == 0:
             future = health
         else:
             future = max(0, 100 - float(cpu_pred[-1]))
 
+        # ---------- Confidence ----------
         conf = prediction_confidence(df_full)
 
-        c1.metric("❤️ Current Health", f"{health}/100", f"{health-future:+.1f} than Predicted Health")
-        c2.metric("💖 Predicted Health", f"{future:.1f}/100", f"{future-health:+.1f} than Current Health")
+        # store ONLY after prediction starts
+        st.session_state.confidence_history = pd.concat([
+            st.session_state.confidence_history,
+            pd.DataFrame([{
+                "timestamp": datetime.now(),
+                "confidence": conf
+            }])
+        ], ignore_index=True)
+
+        # ---------- Prepare Sparkline ----------
         conf_df = st.session_state.confidence_history.copy()
 
-        # 🔥 APPLY SAME TIME WINDOW FILTER
+        # apply same window
         conf_df = conf_df[conf_df["timestamp"] >= cutoff]
 
-        # 🔥 fallback if too few points
-        if len(conf_df) < 5:
-            conf_df = st.session_state.confidence_history.copy().tail(10)
-
         conf_series = conf_df["confidence"].astype(float).tolist()
+
+        # ✅ CRITICAL FIX: ensure sparkline always renders
+        if len(conf_series) == 0:
+            conf_series = [conf, conf]
+        elif len(conf_series) == 1:
+            conf_series = conf_series * 2
+
+        # optional: slight smoothing for better UX
+        if len(conf_series) > 3:
+            conf_series = pd.Series(conf_series).rolling(3, min_periods=1).mean().tolist()
+
+        # ---------- Metrics ----------
+        c1.metric(
+            "❤️ Current Health",
+            f"{health}/100",
+            f"{health - future:+.1f} than Predicted Health"
+        )
+
+        c2.metric(
+            "💖 Predicted Health",
+            f"{future:.1f}/100",
+            f"{future - health:+.1f} than Current Health"
+        )
 
         c3.metric(
             "🌟 Confidence",
             f"{conf}%",
             delta=None,
             chart_data=conf_series,
-            chart_type="line"
+            chart_type="area"
         )
+
         c4.metric("📋 Status", status_label(health))
         c5.metric("🔥 Prometheus", "Connected" if prom_ok else "Disconnected ❌")
-
-    else:
-        c1.metric("❤️ Current Health", f"{health}/100")
-        c2.metric("💖 Predicted Health","...", "Waiting for LSTM engine to start prediction", delta_color="off", delta_arrow="off")
-        c3.metric("🧪 Samples Needed", SEQ_LEN-usable, "out of 40", delta_color="off", delta_arrow="off")
-        c4.metric("📋 Status","Collecting Metrics")
-        c5.metric("🔥 Prometheus", "Connected" if prom_ok else "Disconnected ❌")
-
 # =========================
 # PANEL
 # =========================
